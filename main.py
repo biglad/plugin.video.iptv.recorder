@@ -513,7 +513,7 @@ def record_and_play(channelname):
 
     start = utcnow - timedelta(seconds=utc_offset)
 
-    hours = xbmcgui.Dialog().input("Hours",type=xbmcgui.INPUT_NUMERIC,defaultt="4")
+    hours = xbmcgui.Dialog().input("Hours",type=xbmcgui.INPUT_NUMERIC,defaultt="2")
     #log(hours)
 
     stop = utcnow - timedelta(seconds=utc_offset) + timedelta(hours=int(hours))
@@ -524,7 +524,7 @@ def record_and_play(channelname):
     channelid = None
     threading.Thread(target=record_once_thread,args=[None, do_refresh, watch, remind, channelid, channelname, start, stop, True, None]).start()
     time.sleep(5)
-
+    #xbmc.executebuiltin("Container.Refresh")
     return recordings()
 
 
@@ -534,6 +534,36 @@ def record_once_time(channelid, channelname, start, stop, do_refresh=True, watch
         channelid = channelid.decode("utf8")
     channelname = channelname.decode("utf8")
     threading.Thread(target=record_once_thread,args=[None, do_refresh, watch, remind, channelid, channelname, start, stop, False, title]).start()
+
+
+@plugin.route('/record_epg/<channelname>/<name>/<start>/<stop>')
+def record_epg(channelname, name, start, stop):
+
+    channelname = channelname.decode("utf8")
+    name = name.decode("utf8")
+
+    start = get_utc_from_string(start.decode("utf8"))
+    stop = get_utc_from_string(stop.decode("utf8"))
+
+    log("Scheduling record for '{}: {} ({} to {})'".format(channelname, name, start, stop))
+
+    do_refresh = False
+    watch = False
+    remind = False
+    channelid = None
+    threading.Thread(target=record_once_thread,args=[None, do_refresh, watch, remind, channelid, channelname, start, stop, False, name]).start()
+
+
+def get_utc_from_string(date_string):
+    utcnow = datetime.utcnow()
+    ts = time.time()
+    utc_offset = total_seconds(datetime.fromtimestamp(ts) - datetime.utcfromtimestamp(ts))
+
+    r = re.search(r'(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):\d{2}', date_string)
+    if r:
+        year, month, day, hour, minute = r.group(1), r.group(2), r.group(3), r.group(4), r.group(5)
+        return utcnow.replace(day=int(day), month=int(month), year=int(year), hour=int(hour), minute=int(minute),
+                              second=0, microsecond=0) - timedelta(seconds=utc_offset)
 
 
 def record_once_thread(programmeid, do_refresh=True, watch=False, remind=False, channelid=None, channelname=None, start=None,stop=None, play=False, title=None):
@@ -616,6 +646,7 @@ def record_once_thread(programmeid, do_refresh=True, watch=False, remind=False, 
                 folder = ftitle
                 filename = "%s %s - %s - %s" % (ftitle, episode, fchannelname, local_starttime.strftime("%Y-%m-%d %H-%M"))
         else:
+            folder = ftitle
             if sub_title:
                 filename = "%s %s - %s - %s" % (ftitle, fsub_title, fchannelname, local_starttime.strftime("%Y-%m-%d %H-%M"))
             else:
@@ -672,10 +703,11 @@ def record_once_thread(programmeid, do_refresh=True, watch=False, remind=False, 
     if not ffmpeg:
         return
 
-    json_nfo = json.dumps(nfo)
-    f = xbmcvfs.File(json_path,'w')
-    f.write(json_nfo)
-    f.close()
+    if plugin.get_setting('json',bool):
+        json_nfo = json.dumps(nfo)
+        f = xbmcvfs.File(json_path,'w')
+        f.write(json_nfo)
+        f.close()
 
     cmd = [ffmpeg]
     cmd.append("-i")
@@ -688,7 +720,7 @@ def record_once_thread(programmeid, do_refresh=True, watch=False, remind=False, 
 
     ffmpeg_recording_path = os.path.join(ffmpeg_dir, filename + '.' + plugin.get_setting("ffmpeg.ext"))
 
-    cmd = probe_cmd + ["-y", "-t", str(seconds), "-c", "copy"]
+    cmd = probe_cmd + ["-y", "-t", str(seconds), "-fflags","+genpts","-vcodec","copy","-acodec","copy"]
     ffmpeg_reconnect = plugin.get_setting('ffmpeg.reconnect',bool)
     if ffmpeg_reconnect:
         cmd = cmd + ["-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "300"]
@@ -823,6 +855,38 @@ def record_once_thread(programmeid, do_refresh=True, watch=False, remind=False, 
 
     if do_refresh:
         refresh()
+
+
+@plugin.route('/convert/<path>')
+def convert(path):
+    input = xbmcvfs.File(path,'rb')
+    output = xbmcvfs.File(path.replace('.ts','.mp4'),'wb')
+    error = open(xbmc.translatePath("special://profile/addon_data/plugin.video.iptv.recorder/errors.txt"),"w")
+
+    cmd = [ffmpeg_location(),"-fflags","+genpts","-y","-i","-","-vcodec","copy","-acodec","copy","-f", "mpegts", "-"]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error, shell=windows())
+    t = threading.Thread(target=read_thread,args=[p,output])
+    t.start()
+
+    while True:
+        data = input.read(100000)
+        log(("read",len(data)))
+        if not data:
+            break
+        p.stdin.write(data)
+    p.stdin.close()
+    error.close()
+
+
+
+def read_thread(p,output):
+    while True:
+        data = p.stdout.read(100000)
+        if not len(data):
+            break
+        output.write(data)
+    output.close()
+
 
 @plugin.route('/renew_jobs')
 def renew_jobs():
@@ -1395,6 +1459,15 @@ def broadcast(programmeid, channelname):
     etitle = title.encode("utf8")
 
     items = []
+	
+    items.append({
+        'label': _("Play Channel") + " - %s" % (channelname),
+        'path': plugin.url_for(play_channel, channelname=echannelname),
+        'thumbnail': thumbnail or get_icon_path('tv'),
+        'info_type': 'video',
+        'info':{"title": channelname},
+        'is_playable': True,
+    })
 
     items.append({
         'label': _("Record Once") + " - %s - %s %s[COLOR grey]%s - %s[/COLOR]" % (channelname, title, CR, utc2local(start), utc2local(stop)),
@@ -1468,14 +1541,6 @@ def broadcast(programmeid, channelname):
         'label': _("Remind Weekly") + " - %s - %s %s[COLOR grey]%s - %s[/COLOR]" % (channelname, title, CR, utc2local(start).time(), utc2local(stop).time()),
         'path': plugin.url_for(remind_weekly, channelid=echannelid, channelname=echannelname, title=etitle, start=start_ts, stop=stop_ts),
         'thumbnail': thumbnail or get_icon_path('recordings'),
-    })
-    items.append({
-        'label': _("Play Channel") + " - %s" % (channelname),
-        'path': plugin.url_for(play_channel, channelname=echannelname),
-        'thumbnail': thumbnail or get_icon_path('tv'),
-        'info_type': 'video',
-        'info':{"title": channelname},
-        'is_playable': True,
     })
 
     if plugin.get_setting('external.player'):
@@ -1985,6 +2050,11 @@ def listing(programmes, scroll=False, channelname=None):
         echannelname=pchannelname.encode("utf8")
         etitle=title.encode("utf8")
         ecategories=categories.encode("utf8")
+		
+        if url:
+            context_items.append((_("Play Channel"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel, channelname=echannelname))))
+            if plugin.get_setting('external.player'):
+                context_items.append((_("Play Channel External"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel_external, channelname=echannelname))))
 
         if recording:
             for uuid, type in jobs:
@@ -2004,10 +2074,7 @@ def listing(programmes, scroll=False, channelname=None):
                 context_items.append((_("Remind Once"), 'XBMC.RunPlugin(%s)' %
                 (plugin.url_for(remind_once, programmeid=uid, channelid=echannelid, channelname=echannelname))))
 
-        if url:
-            context_items.append((_("Play Channel"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel, channelname=echannelname))))
-            if plugin.get_setting('external.player'):
-                context_items.append((_("Play Channel External"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel_external, channelname=echannelname))))
+
 
         context_items.append((echannelname, 'ActivateWindow(%s,%s,return)' % (xbmcgui.getCurrentWindowId(), plugin.url_for('channel', channelid=echannelid, channelname=echannelname))))
         context_items.append((etitle, 'ActivateWindow(%s,%s,return)' % (xbmcgui.getCurrentWindowId(), plugin.url_for('search_title', title=etitle))))
@@ -2252,6 +2319,7 @@ def group(channelgroup=None,section=None):
             channelid =channelid.encode("utf8")
 
         if url:
+            context_items.append((_("Play Channel"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel, channelname=channelname))))
             context_items.append((_("Add One Time Rule"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(record_one_time, channelname=channelname))))
             context_items.append((_("Add Daily Time Rule"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(record_daily_time, channelname=channelname))))
             context_items.append((_("Add Weekly Time Rule"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(record_weekly_time, channelname=channelname))))
@@ -2259,7 +2327,7 @@ def group(channelgroup=None,section=None):
             if channelid:
                 context_items.append((_("Add Title Search Rule"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(record_always_search, channelid=channelid, channelname=channelname))))
                 context_items.append((_("Add Plot Search Rule"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(record_always_search_plot, channelid=channelid, channelname=channelname))))
-            context_items.append((_("Play Channel"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel, channelname=channelname))))
+            
             if plugin.get_setting('external.player'):
                 context_items.append((_("Play Channel External"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_channel_external, channelname=channelname))))
 
@@ -2560,6 +2628,7 @@ def delete_recording(label, path):
     length = int(len('.' + plugin.get_setting("ffmpeg.ext")))
     xbmcvfs.delete(path[:-length]+'.json')
     refresh()
+    xbmc.executebuiltin("Container.Refresh")
 
 
 @plugin.route('/delete_all_recordings')
@@ -2580,6 +2649,7 @@ def delete_all_recordings():
 
     rmdirs(dir)
     refresh()
+    xbmc.executebuiltin("Container.Refresh")
 
 
 def find_files(root):
@@ -2638,6 +2708,7 @@ def recordings():
         context_items.append((_("Delete All Recordings"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(delete_all_recordings))))
         if plugin.get_setting('external.player'):
             context_items.append((_("External Player"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(play_external, path=path))))
+        #context_items.append((_("Convert to mp4"), 'XBMC.RunPlugin(%s)' % (plugin.url_for(convert, path=path))))
 
         items.append({
             'label': label,
@@ -3264,24 +3335,24 @@ def estuary():
         text = f.read()
     text = text.replace('<control type="grouplist" id="9000">',
     '''<control type="grouplist" id="9000">
-					<include content="InfoDialogButton">
-						<param name="width" value="275" />
-						<param name="id" value="666" />
-						<param name="icon" value="icons/infodialogs/record.png" />
-						<param name="label" value="IPTV Recorder" />
-						<param name="onclick_1" value="Action(close)" />
-						<param name="onclick_2" value="RunScript(plugin.video.iptv.recorder,$ESCINFO[ListItem.ChannelName],$ESCINFO[ListItem.Title],$ESCINFO[ListItem.Date],$ESCINFO[ListItem.Duration],$ESCINFO[ListItem.Plot])" />
-						<param name="visible" value="System.hasAddon(plugin.video.iptv.recorder)" />
-					</include>
-					<include content="InfoDialogButton">
-						<param name="width" value="275" />
-						<param name="id" value="667" />
-						<param name="icon" value="icons/infodialogs/record.png" />
-						<param name="label" value="Recordings" />
-						<param name="onclick_1" value="Action(close)" />
-						<param name="onclick_2" value="ActivateWindow(10025,&quot;plugin://plugin.video.iptv.recorder/recordings&quot;,return)" />
-						<param name="visible" value="System.hasAddon(plugin.video.iptv.recorder)" />
-					</include>''')
+                    <include content="InfoDialogButton">
+                        <param name="width" value="275" />
+                        <param name="id" value="666" />
+                        <param name="icon" value="icons/infodialogs/record.png" />
+                        <param name="label" value="IPTV Recorder" />
+                        <param name="onclick_1" value="Action(close)" />
+                        <param name="onclick_2" value="RunScript(plugin.video.iptv.recorder,$ESCINFO[ListItem.ChannelName],$ESCINFO[ListItem.Title],$ESCINFO[ListItem.Date],$ESCINFO[ListItem.Duration],$ESCINFO[ListItem.Plot])" />
+                        <param name="visible" value="System.hasAddon(plugin.video.iptv.recorder)" />
+                    </include>
+                    <include content="InfoDialogButton">
+                        <param name="width" value="275" />
+                        <param name="id" value="667" />
+                        <param name="icon" value="icons/infodialogs/record.png" />
+                        <param name="label" value="Recordings" />
+                        <param name="onclick_1" value="Action(close)" />
+                        <param name="onclick_2" value="ActivateWindow(10025,&quot;plugin://plugin.video.iptv.recorder/recordings&quot;,return)" />
+                        <param name="visible" value="System.hasAddon(plugin.video.iptv.recorder)" />
+                    </include>''')
     with open(filename,'w') as f:
         f.write(text)
 
@@ -3325,14 +3396,14 @@ def index():
 
 
 
-    if plugin.get_setting('show.skin',bool):
-        items.append(
-        {
-            'label': "[COLOR yellow]NEW! Create Estuary (IPTV Recorder) Skin[/COLOR]",
-            'path': plugin.url_for('estuary'),
-            'thumbnail':get_icon_path('popular'),
-            'context_menu': context_items,
-        })
+    #if plugin.get_setting('show.skin',bool):
+    #    items.append(
+    #    {
+    #        'label': "[COLOR yellow]NEW! Create Estuary (IPTV Recorder) Skin[/COLOR]",
+    #        'path': plugin.url_for('estuary'),
+    #        'thumbnail':get_icon_path('popular'),
+    #        'context_menu': context_items,
+    #    })
 
     items.append(
     {
